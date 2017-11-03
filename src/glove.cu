@@ -30,6 +30,8 @@
 #include <pthread.h>
 #include <time.h>
 
+#include <cuda_runtime.h>
+
 #define _FILE_OFFSET_BITS 64
 #define MAX_STRING_LENGTH 1000
 
@@ -50,11 +52,15 @@ int save_gradsq = 0; // By default don't save squared gradient values
 int use_binary = 0; // 0: save as text files; 1: save as binary; 2: both. For binary, save both word and context word vectors.
 int model = 2; // For text file output only. 0: concatenate word and context vectors (and biases) i.e. save everything; 1: Just save word vectors (no bias); 2: Save (word + context word) vectors (no biases)
 int checkpoint_every = 0; // checkpoint the model for every checkpoint_every iterations. Do nothing if checkpoint_every <= 0
-real eta = 0.05; // Initial learning rate
-real alpha = 0.75, x_max = 100.0; // Weighting function parameters, not extremely sensitive to corpus, though may need adjustment for very small or very large corpora
+real eta_cpu = 0.05; // Initial learning rate
+real alpha_cpu = 0.75, x_max_cpu = 100.0; // Weighting function parameters, not extremely sensitive to corpus, though may need adjustment for very small or very large corpora
 real *W, *gradsq, *cost;
-long long num_lines, *lines_per_thread, vocab_size;
+real *W_gpu, *gradsq_gpu;
+unsigned int vocab_size, num_lines;
 char *vocab_file, *input_file, *save_W_file, *save_gradsq_file;
+
+__constant__ unsigned voca_size, num_lines_gpu;
+__constant__ real eta, alpha, x_max;
 
 /* Efficient string comparison */
 int scmp( char *s1, char *s2 ) {
@@ -77,14 +83,25 @@ void initialize_parameters() {
         fprintf(stderr, "Error allocating memory for gradsq\n");
         exit(1);
     }
+    if(cudaMalloc((void**)&W_gpu, 2 * vocab_size * (vector_size + 1) * sizeof(real)) != cudaSuccess) {
+        printf("W alloc error\n");
+        exit(1);
+    }
+    if(cudaMalloc((void**)&gradsq_gpu, 2 * vocab_size * (vector_size + 1) * sizeof(real)) != cudaSuccess) {
+        printf("gradsq alloc error\n");
+        exit(1);
+    }
+
 	for (b = 0; b < vector_size; b++) for (a = 0; a < 2 * vocab_size; a++) W[a * vector_size + b] = (rand() / (real)RAND_MAX - 0.5) / vector_size;
 	for (b = 0; b < vector_size; b++) for (a = 0; a < 2 * vocab_size; a++) gradsq[a * vector_size + b] = 1.0; // So initial value of eta is equal to initial learning rate
+    cudaMemcpy(W_gpu, W, 2 * vocab_size * (vector_size + 1) * sizeof(real), cudaMemcpyHostToDevice);
+    cudaMemcpy(gradsq_gpu, gradsq, 2 * vocab_size * (vector_size + 1) * sizeof(real), cudaMemcpyHostToDevice);
 	vector_size--;
 }
 
-inline real check_nan(real update) {
+__host__ __device__ inline real check_nan(real update) {
     if (isnan(update) || isinf(update)) {
-        fprintf(stderr,"\ncaught NaN in update");
+        printf("\ncaught NaN in update");
         return 0.;
     } else {
         return update;
@@ -92,77 +109,79 @@ inline real check_nan(real update) {
 }
 
 /* Train the GloVe model */
-void *glove_thread(void *vid) {
-    long long a, b ,l1, l2;
-    long long id = *(long long*)vid;
-    CREC cr;
-    real diff, fdiff, temp1, temp2;
-    FILE *fin;
-    fin = fopen(input_file, "rb");
-    fseeko(fin, (num_lines / num_threads * id) * (sizeof(CREC)), SEEK_SET); //Threads spaced roughly equally throughout file
+__global__ void glove_thread(real* cost, const CREC* data, real* W, real* gradsq, int steps) {
+    long long a, l1, l2;
+    unsigned int id = blockIdx.x;
+    unsigned int b = threadIdx.x;
+    int vec_size = blockDim.x;
+    real temp1, temp2;
+    extern __shared__ real diff[];
+    real fdiff;
+    int data_idx = steps * id;
+    int data_end = steps * (id + 1);
+    int data_len;
+    if (data_end > num_lines_gpu) data_end = num_lines_gpu;
+    data_len = data_end - data_idx;
     cost[id] = 0;
-    
-    real* W_updates1 = (real*)malloc(vector_size * sizeof(real));
-    real* W_updates2 = (real*)malloc(vector_size * sizeof(real));
-    for (a = 0; a < lines_per_thread[id]; a++) {
-        fread(&cr, sizeof(CREC), 1, fin);
-        if (feof(fin)) break;
+
+    real W_updates1;
+    real W_updates2;
+    //printf("Thread: %d, data_idx: %d, steps: %d, data_len: %d\n", id, data_idx, steps, data_len);
+    for (a = 0; a < data_len; a++) {
+        const CREC &cr = data[data_idx++];
         if (cr.word1 < 1 || cr.word2 < 1) { continue; }
-        
+
         /* Get location of words in W & gradsq */
-        l1 = (cr.word1 - 1LL) * (vector_size + 1); // cr word indices start at 1
-        l2 = ((cr.word2 - 1LL) + vocab_size) * (vector_size + 1); // shift by vocab_size to get separate vectors for context words
-        
+        l1 = (cr.word1 - 1LL) * (vec_size + 1); // cr word indices start at 1
+        l2 = ((cr.word2 - 1LL) + voca_size) * (vec_size + 1); // shift by vocab_size to get separate vectors for context words
+
         /* Calculate cost, save diff for gradients */
-        diff = 0;
-        for (b = 0; b < vector_size; b++) diff += W[b + l1] * W[b + l2]; // dot product of word and context word vector
-        diff += W[vector_size + l1] + W[vector_size + l2] - log(cr.val); // add separate bias for each word
-        fdiff = (cr.val > x_max) ? diff : pow(cr.val / x_max, alpha) * diff; // multiply weighting function (f) with diff
+        diff[b] = W[b + l1] * W[b + l2]; // dot product of word and context word vector
+        __syncthreads();
+        // 0x1000はスレッド数の半分よりも大きい数。
+        for(unsigned int s = 0x1000;s>0;s>>=1) {
+            if(b < s && b + s < vec_size) diff[b] = diff[b] + diff[b + s];
+            __syncthreads();
+        }
+        if (b == 0) diff[0] += W[vec_size + l1] + W[vec_size + l2] - log(cr.val);
+        __syncthreads();
+        fdiff = (cr.val > x_max) ? diff[0] : pow(cr.val / x_max, alpha) * diff[0]; // multiply weighting function (f) with diff
 
         // Check for NaN and inf() in the diffs.
-        if (isnan(diff) || isnan(fdiff) || isinf(diff) || isinf(fdiff)) {
-            fprintf(stderr,"Caught NaN in diff for kdiff for thread. Skipping update");
+        if (isnan(diff[0]) || isnan(fdiff) || isinf(diff[0]) || isinf(fdiff)) {
+            printf("Caught NaN in diff for kdiff for thread. Skipping update");
             continue;
         }
 
-        cost[id] += 0.5 * fdiff * diff; // weighted squared error
+        if (b == 0) cost[id] += 0.5 * fdiff * diff[0]; // weighted squared error
         
         /* Adaptive gradient updates */
         fdiff *= eta; // for ease in calculating gradient
-        real W_updates1_sum = 0;
-        real W_updates2_sum = 0;
-        for (b = 0; b < vector_size; b++) {
-            // learning rate times gradient for word vectors
-            temp1 = fdiff * W[b + l2];
-            temp2 = fdiff * W[b + l1];
-            // adaptive updates
-            W_updates1[b] = temp1 / sqrt(gradsq[b + l1]);
-            W_updates2[b] = temp2 / sqrt(gradsq[b + l2]);
-            W_updates1_sum += W_updates1[b];
-            W_updates2_sum += W_updates2[b];
-            gradsq[b + l1] += temp1 * temp1;
-            gradsq[b + l2] += temp2 * temp2;
-        }
-        if (!isnan(W_updates1_sum) && !isinf(W_updates1_sum) && !isnan(W_updates2_sum) && !isinf(W_updates2_sum)) {
-            for (b = 0; b < vector_size; b++) {
-                W[b + l1] -= W_updates1[b];
-                W[b + l2] -= W_updates2[b];
-            }
+
+        // learning rate times gradient for word vectors
+        temp1 = fdiff * W[b + l2];
+        temp2 = fdiff * W[b + l1];
+        // adaptive updates
+        W_updates1 = temp1 / sqrt(gradsq[b + l1]);
+        W_updates2 = temp2 / sqrt(gradsq[b + l2]);
+        gradsq[b + l1] += temp1 * temp1;
+        gradsq[b + l2] += temp2 * temp2;
+            
+        if (!isnan(W_updates1) && !isinf(W_updates1) && !isnan(W_updates2) && !isinf(W_updates2)) {
+            W[b + l1] -= W_updates1;
+            W[b + l2] -= W_updates2;
         }
 
         // updates for bias terms
-        W[vector_size + l1] -= check_nan(fdiff / sqrt(gradsq[vector_size + l1]));
-        W[vector_size + l2] -= check_nan(fdiff / sqrt(gradsq[vector_size + l2]));
-        fdiff *= fdiff;
-        gradsq[vector_size + l1] += fdiff;
-        gradsq[vector_size + l2] += fdiff;
-        
+        if (b==0) {
+            W[vec_size + l1] -= check_nan(fdiff / sqrt(gradsq[vec_size + l1]));
+            W[vec_size + l2] -= check_nan(fdiff / sqrt(gradsq[vec_size + l2]));
+            fdiff *= fdiff;
+            gradsq[vec_size + l1] += fdiff;
+            gradsq[vec_size + l2] += fdiff;
+        }
+        __syncthreads();
     }
-    free(W_updates1);
-    free(W_updates2);
-    
-    fclose(fin);
-    pthread_exit(NULL);
 }
 
 /* Save params to file */
@@ -176,7 +195,7 @@ int save_params(int nb_iter) {
     long long a, b;
     char format[20];
     char output_file[MAX_STRING_LENGTH], output_file_gsq[MAX_STRING_LENGTH];
-    char *word = malloc(sizeof(char) * MAX_STRING_LENGTH + 1);
+    char *word = (char*)malloc(sizeof(char) * MAX_STRING_LENGTH + 1);
     FILE *fid, *fout, *fgs;
     
     if (use_binary > 0) { // Save parameters in binary file
@@ -286,40 +305,64 @@ int train_glove() {
     int b;
     FILE *fin;
     real total_cost = 0;
+    CREC *data_host, *data;
+    int steps;
+    real *cost_gpu;
+
 
     fprintf(stderr, "TRAINING MODEL\n");
+    if (cudaMalloc(&cost_gpu, num_threads * sizeof(real)) != cudaSuccess) {
+        printf("allocation failed.\n");
+        exit(1);
+    }
     
     fin = fopen(input_file, "rb");
     if (fin == NULL) {fprintf(stderr,"Unable to open cooccurrence file %s.\n",input_file); return 1;}
     fseeko(fin, 0, SEEK_END);
     file_size = ftello(fin);
     num_lines = file_size/(sizeof(CREC)); // Assuming the file isn't corrupt and consists only of CREC's
+    data_host = (CREC*)malloc(file_size);
+    if (!data_host) {
+        printf("host allocation failed.\n");
+        exit(1);
+    }
+    fseeko(fin, 0, SEEK_SET);
+    fread(data_host, sizeof(CREC), num_lines, fin);
     fclose(fin);
+    if (cudaMalloc(&data, file_size) != cudaSuccess) {
+        printf("allocation failed.\n");
+        exit(1);
+    }
+    if (cudaMemcpy(data, data_host, file_size, cudaMemcpyHostToDevice) != cudaSuccess) {
+        printf("memcpy failed.\n");
+        exit(1);
+    }
+    free(data_host);
+
+    if (cudaMemcpyToSymbol(num_lines_gpu, &num_lines, sizeof(num_lines)) != cudaSuccess) {
+        printf("nu failed.\n");
+        exit(1);
+    }
+
     fprintf(stderr,"Read %lld lines.\n", num_lines);
     if (verbose > 1) fprintf(stderr,"Initializing parameters...");
     initialize_parameters();
     if (verbose > 1) fprintf(stderr,"done.\n");
     if (verbose > 0) fprintf(stderr,"vector size: %d\n", vector_size);
     if (verbose > 0) fprintf(stderr,"vocab size: %lld\n", vocab_size);
-    if (verbose > 0) fprintf(stderr,"x_max: %lf\n", x_max);
-    if (verbose > 0) fprintf(stderr,"alpha: %lf\n", alpha);
-    pthread_t *pt = (pthread_t *)malloc(num_threads * sizeof(pthread_t));
-    lines_per_thread = (long long *) malloc(num_threads * sizeof(long long));
+    if (verbose > 0) fprintf(stderr,"x_max: %lf\n", x_max_cpu);
+    if (verbose > 0) fprintf(stderr,"alpha: %lf\n", alpha_cpu);
     
     time_t rawtime;
     struct tm *info;
     char time_buffer[80];
+    steps = num_lines / num_threads;
     // Lock-free asynchronous SGD
     for (b = 0; b < num_iter; b++) {
         total_cost = 0;
-        for (a = 0; a < num_threads - 1; a++) lines_per_thread[a] = num_lines / num_threads;
-        lines_per_thread[a] = num_lines / num_threads + num_lines % num_threads;
-        long long *thread_ids = (long long*)malloc(sizeof(long long) * num_threads);
-        for (a = 0; a < num_threads; a++) thread_ids[a] = a;
-        for (a = 0; a < num_threads; a++) pthread_create(&pt[a], NULL, glove_thread, (void *)&thread_ids[a]);
-        for (a = 0; a < num_threads; a++) pthread_join(pt[a], NULL);
+        glove_thread<<<num_threads, vector_size, sizeof(real) * vector_size>>>(cost_gpu, data, W_gpu, gradsq_gpu, steps);
+        cudaMemcpy(cost, cost_gpu, num_threads * sizeof(real), cudaMemcpyDeviceToHost);
         for (a = 0; a < num_threads; a++) total_cost += cost[a];
-        free(thread_ids);
 
         time(&rawtime);
         info = localtime(&rawtime);
@@ -335,8 +378,16 @@ int train_glove() {
         }
 
     }
-    free(pt);
-    free(lines_per_thread);
+    if(cudaMemcpy(W, W_gpu, 2 * vocab_size * (vector_size + 2) * sizeof(real), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        printf("memcpy err\n");
+        exit(1);
+    }
+    if(cudaMemcpy(gradsq, gradsq_gpu, 2 * vocab_size * (vector_size + 2) * sizeof(real), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        printf("memcpy err\n");
+        exit(1);
+    }
+    cudaFree(cost_gpu);
+    cudaFree(data);
     return save_params(0);
 }
 
@@ -357,10 +408,10 @@ int find_arg(char *str, int argc, char **argv) {
 int main(int argc, char **argv) {
     int i;
     FILE *fid;
-    vocab_file = malloc(sizeof(char) * MAX_STRING_LENGTH);
-    input_file = malloc(sizeof(char) * MAX_STRING_LENGTH);
-    save_W_file = malloc(sizeof(char) * MAX_STRING_LENGTH);
-    save_gradsq_file = malloc(sizeof(char) * MAX_STRING_LENGTH);
+    vocab_file = (char*)malloc(sizeof(char) * MAX_STRING_LENGTH);
+    input_file = (char*)malloc(sizeof(char) * MAX_STRING_LENGTH);
+    save_W_file = (char*)malloc(sizeof(char) * MAX_STRING_LENGTH);
+    save_gradsq_file = (char*)malloc(sizeof(char) * MAX_STRING_LENGTH);
     int result = 0;
     
     if (argc == 1) {
@@ -408,10 +459,10 @@ int main(int argc, char **argv) {
         if ((i = find_arg((char *)"-vector-size", argc, argv)) > 0) vector_size = atoi(argv[i + 1]);
         if ((i = find_arg((char *)"-iter", argc, argv)) > 0) num_iter = atoi(argv[i + 1]);
         if ((i = find_arg((char *)"-threads", argc, argv)) > 0) num_threads = atoi(argv[i + 1]);
-        cost = malloc(sizeof(real) * num_threads);
-        if ((i = find_arg((char *)"-alpha", argc, argv)) > 0) alpha = atof(argv[i + 1]);
-        if ((i = find_arg((char *)"-x-max", argc, argv)) > 0) x_max = atof(argv[i + 1]);
-        if ((i = find_arg((char *)"-eta", argc, argv)) > 0) eta = atof(argv[i + 1]);
+        cost = (real*)malloc(sizeof(real) * num_threads);
+        if ((i = find_arg((char *)"-alpha", argc, argv)) > 0) alpha_cpu = atof(argv[i + 1]);
+        if ((i = find_arg((char *)"-x-max", argc, argv)) > 0) x_max_cpu = atof(argv[i + 1]);
+        if ((i = find_arg((char *)"-eta", argc, argv)) > 0) eta_cpu = atof(argv[i + 1]);
         if ((i = find_arg((char *)"-binary", argc, argv)) > 0) use_binary = atoi(argv[i + 1]);
         if ((i = find_arg((char *)"-model", argc, argv)) > 0) model = atoi(argv[i + 1]);
         if (model != 0 && model != 1) model = 2;
@@ -435,6 +486,18 @@ int main(int argc, char **argv) {
         while ((i = getc(fid)) != EOF) if (i == '\n') vocab_size++; // Count number of entries in vocab_file
         fclose(fid);
 
+        if(cudaMemcpyToSymbol(voca_size, &vocab_size, sizeof(vocab_size)) != cudaSuccess) {
+            printf("vo fail\n"); exit(1);
+        }
+        if(cudaMemcpyToSymbol(alpha, &alpha_cpu, sizeof(alpha_cpu)) != cudaSuccess) {
+            printf("al fail\n"); exit(1);
+        }
+        if(cudaMemcpyToSymbol(x_max, &x_max_cpu, sizeof(x_max_cpu)) != cudaSuccess) {
+            printf("xm fail\n"); exit(1);
+        }
+        if(cudaMemcpyToSymbol(eta, &eta_cpu, sizeof(eta_cpu)) != cudaSuccess) {
+            printf("et fail\n"); exit(1);
+        }
         result = train_glove();
         free(cost);
     }

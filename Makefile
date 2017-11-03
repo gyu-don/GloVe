@@ -4,12 +4,15 @@ CFLAGS = -lm -pthread -Ofast -march=native -funroll-loops -Wno-unused-result
 BUILDDIR := build
 SRCDIR := src
 
+NVCC = nvcc
+NVCCFLAGS = -lm -O3
+
 all: dir glove shuffle cooccur vocab_count
 
 dir :
 	mkdir -p $(BUILDDIR)
-glove : $(SRCDIR)/glove.c
-	$(CC) $(SRCDIR)/glove.c -o $(BUILDDIR)/glove $(CFLAGS)
+glove : $(SRCDIR)/glove.cu
+	$(NVCC) $(SRCDIR)/glove.cu -o $(BUILDDIR)/glove $(NVCCFLAGS)
 shuffle : $(SRCDIR)/shuffle.c
 	$(CC) $(SRCDIR)/shuffle.c -o $(BUILDDIR)/shuffle $(CFLAGS)
 cooccur : $(SRCDIR)/cooccur.c
